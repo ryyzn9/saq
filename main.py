@@ -130,8 +130,8 @@ class S3KLQTrainer:
         self.cfg = cfg
         self.device = next(policy.parameters()).device
         hs = policy.config.hidden_size
-        self.critic = DoubleCritic(hs, cfg.alpha_softmin).to(self.device)
-        self.critic_target = DoubleCritic(hs, cfg.alpha_softmin).to(self.device)
+        self.critic = DoubleCritic(hs, cfg.alpha_softmin).to(self.device).to(torch.bfloat16)
+        self.critic_target = DoubleCritic(hs, cfg.alpha_softmin).to(self.device).to(torch.bfloat16)
         self.critic_target.load_state_dict(self.critic.state_dict())
         for p in self.critic_target.parameters(): p.requires_grad = False
         self.opt_p = torch.optim.AdamW(policy.parameters(), lr=cfg.policy_lr)
@@ -188,7 +188,7 @@ class PPOTrainer:
         self.cfg = cfg
         self.device = next(policy.parameters()).device
         hs = policy.config.hidden_size
-        self.v_head = nn.Sequential(nn.Linear(hs, hs//4), nn.GELU(), nn.Linear(hs//4, 1)).to(self.device)
+        self.v_head = nn.Sequential(nn.Linear(hs, hs//4), nn.GELU(), nn.Linear(hs//4, 1)).to(self.device).to(torch.bfloat16)
         self.opt = torch.optim.AdamW(list(policy.parameters()) + list(self.v_head.parameters()), lr=cfg.policy_lr)
         self.step = 0
     
