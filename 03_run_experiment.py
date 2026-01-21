@@ -6,10 +6,12 @@
 # ## Main Training Loop
 
 # %% Cell 1: Run Setup Script
-# %run 01_setup_h100.py
+print("Loading setup...")
+exec(open("01_setup_h100.py").read())
 
 # %% Cell 2: Run Trainer Script  
-# %run 02_s3klq_trainer.py
+print("Loading trainers...")
+exec(open("02_s3klq_trainer.py").read())
 
 # %% Cell 3: Initialize Trainers
 print("=" * 60)
