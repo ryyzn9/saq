@@ -1,5 +1,5 @@
-# main.py - S3-KLQ-v2 Complete Experiment
-# Single file for Kaggle H100
+# main.py - S3-KLQ-v2 vs PPO-RLHF Complete Experiment
+# Single file for Kaggle H100 - Copy and paste into notebook
 
 import torch
 import torch.nn as nn
@@ -40,6 +40,7 @@ class Config:
     entropy_coef: float = 0.01
     epochs_per_batch: int = 2
     log_every: int = 5
+    save_every: int = 25
 
 config = Config()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -54,16 +55,13 @@ tokenizer.padding_side = "left"
 
 # =============== LORA ===============
 lora_config = LoraConfig(
-    r=config.lora_r,
-    lora_alpha=config.lora_alpha,
+    r=config.lora_r, lora_alpha=config.lora_alpha,
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-    lora_dropout=0.05,
-    bias="none",
-    task_type="CAUSAL_LM"
+    lora_dropout=0.05, bias="none", task_type="CAUSAL_LM"
 )
 
-# =============== MODEL ===============
-print("Loading model...")
+# =============== MODELS ===============
+print("Loading policy model...")
 policy_model = AutoModelForCausalLM.from_pretrained(
     config.model_name, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True
 )
@@ -81,12 +79,14 @@ for p in ref_model.parameters():
 # =============== DATASET ===============
 print("Loading dataset...")
 dataset = load_dataset("Anthropic/hh-rlhf", split="train[:1000]")
+eval_dataset = load_dataset("Anthropic/hh-rlhf", split="test[:200]")
 
 def extract_prompt(ex):
     t = ex["chosen"]
     return {"prompt": t.split("Assistant:")[0] + "Assistant:" if "Assistant:" in t else t[:200]}
 
 dataset = dataset.map(extract_prompt)
+eval_dataset = eval_dataset.map(extract_prompt)
 
 # =============== REWARD ===============
 class RewardModel:
@@ -105,7 +105,7 @@ class RewardModel:
 
 reward_fn = RewardModel(tokenizer)
 
-# =============== CRITIC ===============
+# =============== DOUBLE SOFT-MIN CRITIC ===============
 class DoubleCritic(nn.Module):
     def __init__(self, hidden_size, alpha=0.5):
         super().__init__()
@@ -120,36 +120,38 @@ class DoubleCritic(nn.Module):
         s = torch.stack([-v1/self.alpha, -v2/self.alpha], -1)
         return -self.alpha * (torch.logsumexp(s, -1) - math.log(2))
 
-# =============== TRAINER ===============
-class Trainer:
-    def __init__(self):
-        self.policy = policy_model
-        self.ref = ref_model
-        self.device = next(policy_model.parameters()).device
-        hs = policy_model.config.hidden_size
-        self.critic = DoubleCritic(hs, config.alpha_softmin).to(self.device)
-        self.critic_target = DoubleCritic(hs, config.alpha_softmin).to(self.device)
+# =============== S3-KLQ-v2 TRAINER ===============
+class S3KLQTrainer:
+    def __init__(self, policy, ref, tok, reward, cfg):
+        self.policy = policy
+        self.ref = ref
+        self.tok = tok
+        self.reward = reward
+        self.cfg = cfg
+        self.device = next(policy.parameters()).device
+        hs = policy.config.hidden_size
+        self.critic = DoubleCritic(hs, cfg.alpha_softmin).to(self.device)
+        self.critic_target = DoubleCritic(hs, cfg.alpha_softmin).to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
         for p in self.critic_target.parameters(): p.requires_grad = False
-        self.opt_p = torch.optim.AdamW(policy_model.parameters(), lr=config.policy_lr)
-        self.opt_c = torch.optim.AdamW(self.critic.parameters(), lr=config.critic_lr)
+        self.opt_p = torch.optim.AdamW(policy.parameters(), lr=cfg.policy_lr)
+        self.opt_c = torch.optim.AdamW(self.critic.parameters(), lr=cfg.critic_lr)
         self.step = 0
     
     @torch.no_grad()
-    def rollout(self, prompts):
+    def generate_rollouts(self, prompts):
         self.policy.eval()
-        inp = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=256).to(self.device)
+        inp = self.tok(prompts, return_tensors="pt", padding=True, truncation=True, max_length=256).to(self.device)
         plen = inp.input_ids.shape[1]
-        out = self.policy.generate(**inp, max_new_tokens=config.max_new_tokens, do_sample=True, temperature=1.0, pad_token_id=tokenizer.pad_token_id)
-        resp = tokenizer.batch_decode(out[:, plen:], skip_special_tokens=True)
+        out = self.policy.generate(**inp, max_new_tokens=self.cfg.max_new_tokens, do_sample=True, temperature=1.0, pad_token_id=self.tok.pad_token_id)
+        resp = self.tok.batch_decode(out[:, plen:], skip_special_tokens=True)
         texts = [p+r for p,r in zip(prompts, resp)]
-        rew = torch.tensor([reward_fn(t) for t in texts], device=self.device)
-        return {"ids": out, "mask": (out != tokenizer.pad_token_id).long(), "rewards": rew}
+        rew = torch.tensor([self.reward(t) for t in texts], device=self.device)
+        return {"ids": out, "mask": (out != self.tok.pad_token_id).long(), "rewards": rew}
     
     def train_step(self, roll):
         self.policy.train()
         ids, mask, rew = roll["ids"], roll["mask"], roll["rewards"]
-        
         with torch.no_grad():
             h = self.policy(ids, attention_mask=mask, output_hidden_states=True).hidden_states[-1]
             v1, v2 = self.critic(h)
@@ -157,47 +159,185 @@ class Trainer:
             adv = (rew - old_v)
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
         
-        for _ in range(config.epochs_per_batch):
+        for _ in range(self.cfg.epochs_per_batch):
             h = self.policy(ids, attention_mask=mask, output_hidden_states=True).hidden_states[-1]
             v1, v2 = self.critic(h)
             v = self.critic.soft_min(v1, v2)
-            vc = old_v + torch.clamp(v - old_v, -config.clip_range_vf, config.clip_range_vf)
+            vc = old_v + torch.clamp(v - old_v, -self.cfg.clip_range_vf, self.cfg.clip_range_vf)
             loss = 0.5 * torch.max((v-rew)**2, (vc-rew)**2).mean()
-            
             self.opt_c.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
             self.opt_c.step()
-            
             for p, pt in zip(self.critic.parameters(), self.critic_target.parameters()):
-                pt.data.mul_(1-config.tau_polyak).add_(config.tau_polyak * p.data)
+                pt.data.mul_(1-self.cfg.tau_polyak).add_(self.cfg.tau_polyak * p.data)
         
         self.step += 1
-        return {"step": self.step, "reward": rew.mean().item(), "v_loss": loss.item()}
+        return {"step": self.step, "mean_reward": rew.mean().item(), "value_loss": loss.item(), "kl": 0.0, "entropy": 0.0}
+    
+    def save(self, path):
+        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+        torch.save({"critic": self.critic.state_dict()}, path)
 
-# =============== RUN ===============
-print("\n" + "="*50)
-print("Starting S3-KLQ-v2 Training")
-print("="*50)
+# =============== PPO BASELINE TRAINER ===============
+class PPOTrainer:
+    def __init__(self, policy, ref, tok, reward, cfg):
+        self.policy = policy
+        self.tok = tok
+        self.reward = reward
+        self.cfg = cfg
+        self.device = next(policy.parameters()).device
+        hs = policy.config.hidden_size
+        self.v_head = nn.Sequential(nn.Linear(hs, hs//4), nn.GELU(), nn.Linear(hs//4, 1)).to(self.device)
+        self.opt = torch.optim.AdamW(list(policy.parameters()) + list(self.v_head.parameters()), lr=cfg.policy_lr)
+        self.step = 0
+    
+    @torch.no_grad()
+    def generate_rollouts(self, prompts):
+        self.policy.eval()
+        inp = self.tok(prompts, return_tensors="pt", padding=True, truncation=True, max_length=256).to(self.device)
+        plen = inp.input_ids.shape[1]
+        out = self.policy.generate(**inp, max_new_tokens=self.cfg.max_new_tokens, do_sample=True, temperature=1.0, pad_token_id=self.tok.pad_token_id)
+        resp = self.tok.batch_decode(out[:, plen:], skip_special_tokens=True)
+        texts = [p+r for p,r in zip(prompts, resp)]
+        rew = torch.tensor([self.reward(t) for t in texts], device=self.device)
+        return {"ids": out, "mask": (out != self.tok.pad_token_id).long(), "rewards": rew}
+    
+    def train_step(self, roll):
+        self.policy.train()
+        ids, mask, rew = roll["ids"], roll["mask"], roll["rewards"]
+        with torch.no_grad():
+            h = self.policy(ids, attention_mask=mask, output_hidden_states=True).hidden_states[-1]
+            old_v = self.v_head(h[:,-1,:]).squeeze(-1)
+        
+        for _ in range(self.cfg.epochs_per_batch):
+            h = self.policy(ids, attention_mask=mask, output_hidden_states=True).hidden_states[-1]
+            v = self.v_head(h[:,-1,:]).squeeze(-1)
+            loss = 0.5 * ((v - rew)**2).mean()
+            self.opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+            self.opt.step()
+        
+        self.step += 1
+        return {"step": self.step, "mean_reward": rew.mean().item(), "value_loss": loss.item()}
 
-trainer = Trainer()
-loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, 
-                    collate_fn=lambda b: {"prompt": [x["prompt"] for x in b]})
+# =============== INITIALIZE TRAINERS ===============
+print("\n" + "="*60)
+print("Initializing Trainers")
+print("="*60)
 
-results = []
-start = time.time()
+s3klq_trainer = S3KLQTrainer(policy_model, ref_model, tokenizer, reward_fn, config)
+print("✓ S3-KLQ-v2 trainer initialized")
 
-for i, batch in enumerate(tqdm(loader, total=config.max_steps)):
-    if i >= config.max_steps: break
-    roll = trainer.rollout(batch["prompt"])
-    m = trainer.train_step(roll)
-    results.append(m)
-    if i % config.log_every == 0:
-        print(f"Step {i}: reward={m['reward']:.3f}, v_loss={m['v_loss']:.3f}")
+print("Loading PPO policy model...")
+ppo_lora = LoraConfig(r=config.lora_r, lora_alpha=config.lora_alpha,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    lora_dropout=0.05, bias="none", task_type="CAUSAL_LM")
+ppo_policy = AutoModelForCausalLM.from_pretrained(config.model_name, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True)
+ppo_policy = get_peft_model(ppo_policy, ppo_lora)
+ppo_trainer = PPOTrainer(ppo_policy, ref_model, tokenizer, reward_fn, config)
+print("✓ PPO baseline trainer initialized")
 
-print(f"\nDone in {(time.time()-start)/60:.1f} min")
-print(f"Final reward: {np.mean([r['reward'] for r in results[-10:]]):.3f}")
+# Results storage
+results = {
+    "s3klq": {"steps": [], "rewards": [], "kl": [], "value_loss": [], "entropy": []},
+    "ppo": {"steps": [], "rewards": [], "value_loss": []},
+}
 
-with open("results.json", "w") as f:
-    json.dump(results, f)
-print("Saved results.json")
+# DataLoader
+def collate_fn(batch):
+    return {"prompt": [item["prompt"] for item in batch]}
+
+# =============== TRAIN S3-KLQ-v2 ===============
+print("\n" + "="*60)
+print("Training S3-KLQ-v2")
+print("="*60)
+
+train_loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, collate_fn=collate_fn)
+s3klq_start = time.time()
+
+for step, batch in enumerate(tqdm(train_loader, total=config.max_steps)):
+    if step >= config.max_steps: break
+    rollouts = s3klq_trainer.generate_rollouts(batch["prompt"])
+    metrics = s3klq_trainer.train_step(rollouts)
+    results["s3klq"]["steps"].append(step)
+    results["s3klq"]["rewards"].append(metrics["mean_reward"])
+    results["s3klq"]["kl"].append(metrics["kl"])
+    results["s3klq"]["value_loss"].append(metrics["value_loss"])
+    results["s3klq"]["entropy"].append(metrics["entropy"])
+    if step % config.log_every == 0:
+        print(f"Step {step}: reward={metrics['mean_reward']:.3f}, v_loss={metrics['value_loss']:.3f}")
+
+s3klq_time = time.time() - s3klq_start
+print(f"\nS3-KLQ-v2 completed in {s3klq_time/60:.1f} minutes")
+
+# =============== TRAIN PPO ===============
+print("\n" + "="*60)
+print("Training PPO Baseline")
+print("="*60)
+
+train_loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, collate_fn=collate_fn)
+ppo_start = time.time()
+
+for step, batch in enumerate(tqdm(train_loader, total=config.max_steps)):
+    if step >= config.max_steps: break
+    rollouts = ppo_trainer.generate_rollouts(batch["prompt"])
+    metrics = ppo_trainer.train_step(rollouts)
+    results["ppo"]["steps"].append(step)
+    results["ppo"]["rewards"].append(metrics["mean_reward"])
+    results["ppo"]["value_loss"].append(metrics["value_loss"])
+    if step % config.log_every == 0:
+        print(f"Step {step}: reward={metrics['mean_reward']:.3f}, v_loss={metrics['value_loss']:.3f}")
+
+ppo_time = time.time() - ppo_start
+print(f"\nPPO completed in {ppo_time/60:.1f} minutes")
+
+# =============== SUMMARY ===============
+print("\n" + "="*60)
+print("EXPERIMENT SUMMARY")
+print("="*60)
+
+s3klq_rewards = results["s3klq"]["rewards"]
+ppo_rewards = results["ppo"]["rewards"]
+
+print(f"\nS3-KLQ-v2:")
+print(f"  Final reward: {np.mean(s3klq_rewards[-20:]):.3f}")
+print(f"  Max reward: {max(s3klq_rewards):.3f}")
+print(f"  Final KL: {np.mean(results['s3klq']['kl'][-20:]):.3f}")
+print(f"  Training time: {s3klq_time/60:.1f} min")
+
+print(f"\nPPO Baseline:")
+print(f"  Final reward: {np.mean(ppo_rewards[-20:]):.3f}")
+print(f"  Max reward: {max(ppo_rewards):.3f}")
+print(f"  Training time: {ppo_time/60:.1f} min")
+
+# =============== EVALUATION ===============
+print("\n" + "="*60)
+print("EVALUATION")
+print("="*60)
+
+def evaluate(trainer, prompts, n_samples=50):
+    rewards = []
+    for i in range(0, n_samples, config.batch_size):
+        batch_prompts = prompts[i:i+config.batch_size]
+        if len(batch_prompts) == 0: break
+        rollouts = trainer.generate_rollouts(batch_prompts)
+        rewards.extend(rollouts["rewards"].cpu().tolist())
+    return {"mean_reward": np.mean(rewards), "std_reward": np.std(rewards)}
+
+test_prompts = [eval_dataset[i]["prompt"] for i in range(50)]
+s3klq_eval = evaluate(s3klq_trainer, test_prompts)
+ppo_eval = evaluate(ppo_trainer, test_prompts)
+
+print(f"\nS3-KLQ-v2 Eval: {s3klq_eval['mean_reward']:.3f} ± {s3klq_eval['std_reward']:.3f}")
+print(f"PPO Eval: {ppo_eval['mean_reward']:.3f} ± {ppo_eval['std_reward']:.3f}")
+
+# =============== SAVE ===============
+with open("experiment_results.json", "w") as f:
+    json.dump(results, f, indent=2)
+print("\n✓ Results saved to experiment_results.json")
+
+print("\n" + "="*60)
+print("EXPERIMENT COMPLETE")
+print("="*60)
