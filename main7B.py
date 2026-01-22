@@ -201,35 +201,85 @@ class S3KLQTrainer:
         self.policy.train()
         ids, mask, rew = roll["ids"], roll["mask"], roll["rewards"]
         kl_measured = roll["kl"]
+        plen = (ids.shape[1] - roll["policy_logprobs"].shape[1])
+        
+        # Old log probs (stored during rollout)
+        old_policy_logprobs = roll["policy_logprobs"]
+        ref_logprobs = roll["ref_logprobs"]
+        response_mask = (ids[:, plen:] != self.tok.pad_token_id).float()
         
         with torch.no_grad():
             h = self.policy(ids, attention_mask=mask, output_hidden_states=True).hidden_states[-1]
             v1, v2 = self.critic(h)
             old_v = self.critic.soft_min(v1, v2)
+            
+            # Advantages
             adv = (rew - old_v)
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+            returns = rew
         
-        total_loss = 0
+        total_policy_loss = 0
+        total_value_loss = 0
+        total_kl = 0
+        
         for _ in range(self.cfg.epochs_per_batch):
-            h = self.policy(ids, attention_mask=mask, output_hidden_states=True).hidden_states[-1]
+            # Forward pass
+            outputs = self.policy(ids, attention_mask=mask, output_hidden_states=True)
+            h = outputs.hidden_states[-1]
+            logits = outputs.logits[:, plen-1:-1, :]
+            
+            # Current log probs
+            log_probs = F.log_softmax(logits.float(), dim=-1)
+            tokens = ids[:, plen:]
+            current_logprobs = torch.gather(log_probs, -1, tokens.unsqueeze(-1)).squeeze(-1)
+            
+            # Per-token log ratio
+            log_ratio = current_logprobs - old_policy_logprobs.float()
+            ratio = torch.exp(log_ratio)
+            
+            # Clipped surrogate
+            adv_expanded = adv.unsqueeze(1).expand_as(ratio)
+            surr1 = ratio * adv_expanded
+            surr2 = torch.clamp(ratio, 1 - self.cfg.clip_range, 1 + self.cfg.clip_range) * adv_expanded
+            policy_loss = -torch.min(surr1, surr2)
+            policy_loss = (policy_loss * response_mask).sum() / response_mask.sum().clamp(min=1)
+            
+            # KL penalty
+            kl_penalty = (current_logprobs - ref_logprobs.float()) * response_mask
+            kl = kl_penalty.sum() / response_mask.sum().clamp(min=1)
+            kl_loss = self.beta * kl
+            
+            # Value loss
             v1, v2 = self.critic(h)
             v = self.critic.soft_min(v1, v2)
             vc = old_v + torch.clamp(v - old_v, -self.cfg.clip_range_vf, self.cfg.clip_range_vf)
-            loss = 0.5 * torch.max((v-rew)**2, (vc-rew)**2).mean()
-            total_loss += loss.item()
+            value_loss = 0.5 * torch.max((v-returns)**2, (vc-returns)**2).mean()
             
+            # Total loss
+            loss = policy_loss + kl_loss + 0.5 * value_loss
+            
+            # Update policy
+            self.opt_p.zero_grad()
             self.opt_c.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
             torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+            self.opt_p.step()
             self.opt_c.step()
             
+            # Polyak update
             for p, pt in zip(self.critic.parameters(), self.critic_target.parameters()):
                 pt.data.mul_(1-self.cfg.tau_polyak).add_(self.cfg.tau_polyak * p.data)
+            
+            total_policy_loss += policy_loss.item()
+            total_value_loss += value_loss.item()
+            total_kl += kl.item()
         
-        # Adaptive KL
-        if kl_measured > 1.5 * self.cfg.target_kl:
+        # Adaptive KL coefficient
+        avg_kl = total_kl / self.cfg.epochs_per_batch
+        if avg_kl > 1.5 * self.cfg.target_kl:
             self.beta = min(self.beta * 1.5, 10.0)
-        elif kl_measured < 0.5 * self.cfg.target_kl:
+        elif avg_kl < 0.5 * self.cfg.target_kl:
             self.beta = max(self.beta * 0.5, 0.01)
         
         self.step += 1
@@ -237,8 +287,9 @@ class S3KLQTrainer:
             "step": self.step, 
             "reward": rew.mean().item(),
             "reward_std": rew.std().item(),
-            "value_loss": total_loss / self.cfg.epochs_per_batch,
-            "kl": kl_measured,
+            "policy_loss": total_policy_loss / self.cfg.epochs_per_batch,
+            "value_loss": total_value_loss / self.cfg.epochs_per_batch,
+            "kl": avg_kl,
             "completion_length": roll["completion_length"],
             "beta": self.beta,
         }
@@ -281,27 +332,68 @@ class PPOTrainer:
         mask = (tokens != self.tok.pad_token_id).float()
         kl = ((policy_lp - ref_lp) * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
         
-        return {"ids": out, "mask": (out != self.tok.pad_token_id).long(), "rewards": rew, "kl": kl.mean().item(), "completion_length": comp_len}
+        return {
+            "ids": out, "mask": (out != self.tok.pad_token_id).long(), "rewards": rew, 
+            "kl": kl.mean().item(), "completion_length": comp_len,
+            "policy_logprobs": policy_lp, "ref_logprobs": ref_lp,
+            "plen": plen
+        }
     
     def train_step(self, roll):
         self.policy.train()
         ids, mask, rew = roll["ids"], roll["mask"], roll["rewards"]
+        plen = roll["plen"]
+        old_policy_logprobs = roll["policy_logprobs"]
+        ref_logprobs = roll["ref_logprobs"]
+        response_mask = (ids[:, plen:] != self.tok.pad_token_id).float()
+        
         with torch.no_grad():
             h = self.policy(ids, attention_mask=mask, output_hidden_states=True).hidden_states[-1]
             old_v = self.v_head(h[:,-1,:]).squeeze(-1)
+            adv = (rew - old_v)
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+            returns = rew
         
+        total_kl = 0
         for _ in range(self.cfg.epochs_per_batch):
-            h = self.policy(ids, attention_mask=mask, output_hidden_states=True).hidden_states[-1]
+            outputs = self.policy(ids, attention_mask=mask, output_hidden_states=True)
+            h = outputs.hidden_states[-1]
+            logits = outputs.logits[:, plen-1:-1, :]
+            
+            log_probs = F.log_softmax(logits.float(), dim=-1)
+            tokens = ids[:, plen:]
+            current_logprobs = torch.gather(log_probs, -1, tokens.unsqueeze(-1)).squeeze(-1)
+            
+            log_ratio = current_logprobs - old_policy_logprobs.float()
+            ratio = torch.exp(log_ratio)
+            
+            adv_expanded = adv.unsqueeze(1).expand_as(ratio)
+            surr1 = ratio * adv_expanded
+            surr2 = torch.clamp(ratio, 1 - self.cfg.clip_range, 1 + self.cfg.clip_range) * adv_expanded
+            policy_loss = -torch.min(surr1, surr2)
+            policy_loss = (policy_loss * response_mask).sum() / response_mask.sum().clamp(min=1)
+            
+            kl = ((current_logprobs - ref_logprobs.float()) * response_mask).sum() / response_mask.sum().clamp(min=1)
+            kl_loss = self.cfg.kl_coef * kl
+            
             v = self.v_head(h[:,-1,:]).squeeze(-1)
-            loss = 0.5 * ((v - rew)**2).mean()
+            value_loss = 0.5 * ((v - returns)**2).mean()
+            
+            loss = policy_loss + kl_loss + 0.5 * value_loss
+            
             self.opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
             self.opt.step()
+            
+            total_kl += kl.item()
         
         self.step += 1
-        return {"step": self.step, "reward": rew.mean().item(), "reward_std": rew.std().item(), 
-                "value_loss": loss.item(), "kl": roll["kl"], "completion_length": roll["completion_length"]}
+        return {
+            "step": self.step, "reward": rew.mean().item(), "reward_std": rew.std().item(), 
+            "value_loss": value_loss.item(), "kl": total_kl / self.cfg.epochs_per_batch, 
+            "completion_length": roll["completion_length"]
+        }
 
 # =============== PLOTTING ===============
 def plot_results(results, save_path="training_plots.png"):
