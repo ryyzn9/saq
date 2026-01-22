@@ -25,20 +25,20 @@ from torch.utils.data import DataLoader
 # =============== CONFIG ===============
 @dataclass  
 class Config:
-    # Model - 7B scale
-    model_name: str = "Qwen/Qwen2.5-7B"
-    reward_model_name: str = "OpenAssistant/reward-model-deberta-v3-large-v2"
+    # Model - 3B scale (good balance of quality and speed)
+    model_name: str = "Qwen/Qwen2.5-3B"
+    reward_model_name: str = "RLHFlow/ArmoRM-Llama3-8B-v0.1"  # Better RM
     
     # LoRA
     lora_r: int = 64
     lora_alpha: int = 128
     
-    # Training
-    batch_size: int = 2
-    gradient_accumulation: int = 4
-    max_steps: int = 500
-    policy_lr: float = 1e-5
-    critic_lr: float = 5e-5
+    # Training - Larger batch for stability
+    batch_size: int = 8
+    gradient_accumulation: int = 2
+    max_steps: int = 200
+    policy_lr: float = 5e-6
+    critic_lr: float = 2e-5
     max_new_tokens: int = 128
     
     # S3-KLQ-v2 specific
@@ -46,14 +46,14 @@ class Config:
     tau_polyak: float = 0.02
     clip_range: float = 0.2
     clip_range_vf: float = 0.2
-    kl_coef: float = 0.1
+    kl_coef: float = 0.05
     entropy_coef: float = 0.01
     epochs_per_batch: int = 2
-    target_kl: float = 0.1
+    target_kl: float = 0.05
     
     # Logging
     log_every: int = 10
-    save_every: int = 100
+    save_every: int = 50
     eval_every: int = 50
 
 config = Config()
@@ -70,23 +70,47 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "left"
 
-# =============== REWARD MODEL (Real) ===============
+# =============== REWARD MODEL (ArmoRM - Better Quality) ===============
 print("Loading reward model...")
-reward_tokenizer = AutoTokenizer.from_pretrained(config.reward_model_name)
-reward_model = AutoModelForSequenceClassification.from_pretrained(
-    config.reward_model_name, torch_dtype=torch.float16, device_map="auto"
-)
-reward_model.eval()
-
-def compute_reward(text: str) -> float:
-    """Compute reward using actual reward model."""
-    inputs = reward_tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-    inputs = {k: v.to(reward_model.device) for k, v in inputs.items()}
-    with torch.no_grad():
-        outputs = reward_model(**inputs)
-    return outputs.logits[0, 0].item()
-
-print("Reward model loaded")
+try:
+    # Try ArmoRM first (better quality)
+    from transformers import AutoModelForSequenceClassification
+    reward_tokenizer = AutoTokenizer.from_pretrained(config.reward_model_name, trust_remote_code=True)
+    reward_model = AutoModelForSequenceClassification.from_pretrained(
+        config.reward_model_name, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True
+    )
+    reward_model.eval()
+    
+    def compute_reward(text: str) -> float:
+        inputs = reward_tokenizer(text, return_tensors="pt", truncation=True, max_length=1024)
+        inputs = {k: v.to(reward_model.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = reward_model(**inputs)
+        # ArmoRM outputs a score directly
+        if hasattr(outputs, 'score'):
+            return outputs.score.item()
+        elif hasattr(outputs, 'logits'):
+            return outputs.logits[0].item() if outputs.logits.dim() == 1 else outputs.logits[0, 0].item()
+        else:
+            return 0.0
+    print("ArmoRM loaded successfully")
+except Exception as e:
+    print(f"ArmoRM failed: {e}, falling back to simple reward")
+    # Fallback to simple heuristic reward
+    def compute_reward(text: str) -> float:
+        r = 0.0
+        words = text.lower().split()
+        if len(words) > 20 and len(words) < 200:
+            r += 0.3
+        if words:
+            r += len(set(words)) / len(words) * 0.3
+        for w in ["help", "sure", "here", "can", "would"]:
+            if w in text.lower():
+                r += 0.05
+        if len(text.strip()) < 20:
+            r = -0.5
+        return min(max(r, -1.0), 1.0)
+    print("Using fallback reward model")
 
 # =============== LORA ===============
 lora_config = LoraConfig(
